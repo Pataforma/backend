@@ -12,7 +12,7 @@ model user {
   id              String    @id
   nome            String
   email           String    @unique
-  tipo            String
+  tipo            String    @default("pendente")
   status          Boolean   @default(true)
   criado_em       DateTime  @default(now())
   atualizado_em   DateTime  @updatedAt()

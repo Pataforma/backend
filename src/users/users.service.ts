@@ -1,19 +1,19 @@
 import { BadGatewayException, ConflictException, HttpException, Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { SupabaseClient } from '@supabase/supabase-js';
 import { CreateUserDto, UpdateUserDto } from './dto/users.dto';
 import { Database } from 'supabase-types';
+import { getSupabaseAdmin, supabase } from '../utils/supabase';
+import 'dotenv/config';
 
 @Injectable()
 export class UsersService {
 
-    private supabase: SupabaseClient<Database>;
+    private supabaseAdmin: SupabaseClient<Database>;
 
     constructor(private prisma: PrismaService){
-        this.supabase = createClient<Database>(
-            process.env.SUPABASE_URL!,
-            process.env.SUPABASE_SERVICE_ROLE_KEY!
-        );
+        // Usamos a função getSupabaseAdmin para obter o cliente com permissões administrativas
+        this.supabaseAdmin = getSupabaseAdmin();
     }
 
     private async userExistente(id: string){
@@ -27,6 +27,7 @@ export class UsersService {
 
         return user;
     }
+    
     private async verificarEmailEmUso(email: string): Promise<Boolean> {
         const emailExiste = await this.prisma.user.findUnique({
             where: {
@@ -42,32 +43,40 @@ export class UsersService {
     }
 
     async criarUser(userDto: CreateUserDto): Promise<any> {
+        try {
+            await this.verificarEmailEmUso(userDto.email);
 
-        await this.verificarEmailEmUso(userDto.email)
-
-        const {data, error} = await this.supabase.auth.admin.createUser({
-            email: userDto.email,
-            password: userDto.senha,
-            email_confirm: true
-        });
-
-        if(error){
-            throw new BadGatewayException('Erro ao criar o usuário!')
-        }
-
-        await this.prisma.user.create({
-            data: {
-                id: data.user.id,
+            // Criamos o usuário usando a API de admin do Supabase
+            const {data, error} = await this.supabaseAdmin.auth.admin.createUser({
                 email: userDto.email,
-                tipo: userDto.tipo,
-                nome: userDto.nome
-            }
-        });
+                password: userDto.senha,
+                email_confirm: true
+            });
 
-        return { message: 'Usuário criado com sucesso!', novoUsuario: data.user}
+            if(error){
+                throw new BadGatewayException('Erro ao criar o usuário: ' + error.message);
+            }
+
+            // Salvamos os dados do usuário no banco usando o Prisma
+            await this.prisma.user.create({
+                data: {
+                    id: data.user.id,
+                    email: userDto.email,
+                    tipo: userDto.tipo,
+                    nome: userDto.nome
+                }
+            });
+
+            return { message: 'Usuário criado com sucesso!', novoUsuario: data.user};
+        } catch (error) {
+            if(error instanceof HttpException){
+                throw error;
+            }
+            throw new InternalServerErrorException('Erro ao criar o usuário: ' + error.message);
+        }
     }
 
-    async alterarUser(id: string ,updateUserDto: UpdateUserDto){
+    async alterarUser(id: string, updateUserDto: UpdateUserDto){
         try {
             const user = await this.userExistente(id);
 
@@ -79,48 +88,89 @@ export class UsersService {
                 }
             });
 
-            return {message: 'Usuário atualizado com sucesso', usuarioAtualizado}
+            return {message: 'Usuário atualizado com sucesso', usuarioAtualizado};
         } catch (error) {
-
             if(error instanceof HttpException){
-                return error;
+                throw error;
             }
-
-            throw new InternalServerErrorException('Erro ao atualizar o usuário');
+            throw new InternalServerErrorException('Erro ao atualizar o usuário: ' + error.message);
         }  
     }
 
-    async listarUsuarios(){
+    async listarUsuarios(tipo?: string){
         try {
+            const where = tipo ? { tipo } : {};
+            
             const users = await this.prisma.user.findMany({
-                where: {
-                    tipo: 'veterinário'
-                },
-                
+                where,
+                orderBy: {
+                    criado_em: 'desc'
+                }
             });
 
-            return {message: 'Usuários listados com sucesso', users}
+            return {message: 'Usuários listados com sucesso', users};
         } catch (error) {
             if(error instanceof HttpException){
-                return error;
+                throw error;
             }
-            throw new InternalServerErrorException('Erro ao listar os usuários');
+            throw new InternalServerErrorException('Erro ao listar os usuários: ' + error.message);
         }
     }
 
     async deletarUsuario(id: string){
         try {
             const user = await this.userExistente(id);
-            await this.supabase.auth.admin.deleteUser(user.id);
+            
+            // Deletamos o usuário no Supabase
+            const { error } = await this.supabaseAdmin.auth.admin.deleteUser(user.id);
+            
+            if (error) {
+                throw new BadGatewayException('Erro ao deletar usuário no Supabase: ' + error.message);
+            }
+            
+            // Deletamos o usuário no banco de dados
             await this.prisma.user.delete({
                 where: {id}
             });
-            return {message: 'Usuário deletado com sucesso', user}
+            
+            return {message: 'Usuário deletado com sucesso', user};
         } catch (error) {
             if(error instanceof HttpException){
-                return error;
+                throw error;
             }
-            throw new InternalServerErrorException('Erro ao deletar o usuário');
+            throw new InternalServerErrorException('Erro ao deletar o usuário: ' + error.message);
+        }
+    }
+    
+    // Métodos adicionais para integração com o frontend
+    
+    async getUserByEmail(email: string) {
+        try {
+            const user = await this.prisma.user.findUnique({
+                where: { email }
+            });
+            
+            if (!user) {
+                throw new NotFoundException('Usuário não encontrado');
+            }
+            
+            return user;
+        } catch (error) {
+            if (error instanceof HttpException) {
+                throw error;
+            }
+            throw new InternalServerErrorException('Erro ao buscar usuário: ' + error.message);
+        }
+    }
+    
+    async getUserById(id: string) {
+        try {
+            return await this.userExistente(id);
+        } catch (error) {
+            if (error instanceof HttpException) {
+                throw error;
+            }
+            throw new InternalServerErrorException('Erro ao buscar usuário: ' + error.message);
         }
     }
 }
